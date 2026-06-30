@@ -216,6 +216,11 @@ class HomeAgent(
         # This ensures the exposure system is fully initialized
         self._tools_registered = False
 
+        # Set by the `nachfragen` (ask-followup) tool to keep the conversation
+        # open (voice satellite re-opens the mic without the wake word). Reset at
+        # the start of every turn; read when building the ConversationResult.
+        self._continue_conversation = False
+
         # HTTP session for LLM API calls
         self._session: aiohttp.ClientSession | None = None
 
@@ -285,6 +290,9 @@ class HomeAgent(
         try:
             # Ensure tools are registered (lazy initialization)
             self._ensure_tools_registered()
+
+            # Reset the per-turn ask-followup flag; the `nachfragen` tool sets it.
+            self._continue_conversation = False
 
             # Check if we can stream
             if self._can_stream():
@@ -456,6 +464,15 @@ class HomeAgent(
         # Register ha_query tool
         ha_query = HomeAssistantQueryTool(self.hass, exposed_entity_ids)
         self.tool_handler.register_tool(ha_query)
+
+        # Register the ask-followup ("nachfragen") tool: lets the model keep the
+        # conversation open (mic stays on) instead of guessing when info is missing.
+        from ..tools.ask_followup import AskFollowupTool
+
+        def _set_continue() -> None:
+            self._continue_conversation = True
+
+        self.tool_handler.register_tool(AskFollowupTool(self.hass, _set_continue))
 
         # Register external LLM tool if enabled
         if self.config.get(CONF_EXTERNAL_LLM_ENABLED, False):
@@ -1327,7 +1344,11 @@ class HomeAgent(
         )
 
         # Extract result from chat log
-        return conversation.async_get_result_from_chat_log(user_input, chat_log)
+        result = conversation.async_get_result_from_chat_log(user_input, chat_log)
+        # Explicit ask-followup control overrides HA's "ends with ?" heuristic.
+        if self._continue_conversation:
+            result.continue_conversation = True
+        return result
 
     async def _async_process_synchronous(
         self, user_input: ha_conversation.ConversationInput
@@ -1358,6 +1379,7 @@ class HomeAgent(
         return ha_conversation.ConversationResult(
             response=intent_response,
             conversation_id=user_input.conversation_id,
+            continue_conversation=self._continue_conversation,
         )
 
     async def _process_conversation(
